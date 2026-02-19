@@ -5,7 +5,16 @@
 - **Device**: Raspberry Pi 4 running OSMC
 - **Kernel**: 5.15.92-1-osmc (aarch64 kernel, armhf userland)
 - **USB Adapter**: Fenvi FU-AX1800 (MediaTek MT7921au, USB ID `0e8d:7961`)
-- **Problem**: The `mt7921u` driver was added in kernel 5.18, so it must be compiled as an out-of-tree module for kernel 5.15.
+
+## Why is this guide needed?
+
+The MT7921 WiFi chipset (used in the Fenvi FU-AX1800 and other USB adapters) is supported by the `mt7921u` kernel driver — but that driver was only added in **kernel 5.18**. OSMC ships with **kernel 5.15**, so the driver simply isn't there. This repo backports the driver from 5.18.19, but building it on OSMC is not a straightforward `make && make install` for two reasons:
+
+1. **OSMC uses a mixed-architecture setup.** The Raspberry Pi 4 runs a **64-bit (aarch64) kernel** but OSMC's userland is **32-bit (armhf)**. All system tools — including `gcc` from `apt` — are 32-bit and cannot compile 64-bit kernel modules. You need an aarch64 cross-compiler, and OSMC's cross-compiler package ships inside a chroot that requires wrapper scripts to use.
+
+2. **The kernel source tree needs manual preparation.** OSMC doesn't set up the `/lib/modules/<version>/build` symlink or copy the kernel `.config` by default, so the out-of-tree module build will fail unless you wire these up yourself and run `modules_prepare` first.
+
+The steps below walk through the full process — from installing the toolchain to connecting to WiFi.
 
 ---
 
@@ -26,6 +35,8 @@ sudo dpkg -i /tmp/libssl1.1.deb /tmp/libssl-dev.deb
 
 ## Step 2: Install kernel headers and source
 
+Out-of-tree module builds need the kernel headers and source to compile against. OSMC packages these separately.
+
 ```bash
 sudo apt install -y rbp464-headers-sanitised-5.15.92-1-osmc rbp464-source-5.15.92-1-osmc
 ```
@@ -33,6 +44,8 @@ sudo apt install -y rbp464-headers-sanitised-5.15.92-1-osmc rbp464-source-5.15.9
 > **Note**: Use `apt-cache search rbp464` if the exact version has changed.
 
 ## Step 3: Create the kernel build symlink
+
+The kernel build system expects the source tree at `/lib/modules/<version>/build`, but OSMC doesn't create this symlink automatically.
 
 ```bash
 sudo ln -sf /usr/src/rbp464-source-5.15.92-1-osmc /lib/modules/5.15.92-1-osmc/build
@@ -50,7 +63,7 @@ This installs a chroot-based toolchain at `/opt/osmc-tc/aarch64-toolchain-osmc/`
 
 ## Step 5: Set up cross-compiler wrapper scripts
 
-The toolchain binaries are aarch64 ELF executables inside a chroot. They can run on the aarch64 kernel but need the correct dynamic linker and library paths. Create wrapper scripts for every tool:
+The OSMC toolchain is packaged inside a chroot, so the binaries can't find their dynamic linker and shared libraries when called directly from the host. Wrapper scripts set the correct `LD_LIBRARY_PATH` so the 64-bit compiler tools work outside the chroot.
 
 ```bash
 # Create the dynamic linker symlink
@@ -71,7 +84,7 @@ done
 
 ## Step 6: Create assembler symlinks for GCC
 
-GCC looks for `as`, `ld`, etc. (without the `aarch64-linux-gnu-` prefix) in a specific directory relative to itself. That directory doesn't exist by default:
+When GCC invokes the assembler or linker internally, it looks for unprefixed tool names (`as`, `ld`, etc.) in `<sysroot>/usr/aarch64-linux-gnu/bin/`. The OSMC toolchain doesn't populate this directory, so GCC fails with "unknown assembler invoked". These symlinks fix that.
 
 ```bash
 sudo mkdir -p /opt/osmc-tc/aarch64-toolchain-osmc/usr/aarch64-linux-gnu/bin
@@ -82,6 +95,8 @@ done
 ```
 
 ## Step 7: Copy kernel config and prepare for module building
+
+The kernel source tree needs the running kernel's `.config` and a `modules_prepare` pass to generate the headers and scripts that out-of-tree builds depend on (e.g. `Module.symvers`, generated headers).
 
 ```bash
 sudo cp /boot/config-5.15.92-1-osmc /usr/src/rbp464-source-5.15.92-1-osmc/.config
@@ -97,6 +112,8 @@ sudo -E make -C /usr/src/rbp464-source-5.15.92-1-osmc \
 > **Note**: Ignore the `libarmmem.so` preload warnings — they are harmless (32-bit library being skipped by 64-bit processes).
 
 ## Step 8: Install firmware files
+
+The MT7921 chipset requires firmware blobs that the driver uploads to the device at load time. OSMC's kernel 5.15 doesn't ship these since it has no built-in MT7921 support. Download them from the upstream linux-firmware repository.
 
 ```bash
 sudo mkdir -p /lib/firmware/mediatek
@@ -164,13 +181,15 @@ dmesg | grep mt7921
 
 ## Step 12: Configure autoload on boot
 
+Without this, you'd have to manually `modprobe mt7921u` after every reboot.
+
 ```bash
 echo 'mt7921u' | sudo tee /etc/modules-load.d/mt7921u.conf
 ```
 
 ## Step 13: Connect to WiFi
 
-Create a connman provisioning file:
+OSMC uses connman (not NetworkManager) for network management. A provisioning file tells connman how to connect to your network automatically.
 
 ```bash
 sudo tee /var/lib/connman/your-wifi.config > /dev/null <<'EOF'
